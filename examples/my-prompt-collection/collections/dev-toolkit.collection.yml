@@ -1,0 +1,74 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/AmadeusITGroup/prompt-registry/refs/heads/main/schemas/collection.schema.json
+id: dev-toolkit
+name: Developer Toolkit
+version: 1.0.0
+description: A curated set of prompts, instructions, agents, and skills for everyday software development tasks.
+author: Your Team
+tags:
+  - development
+  - productivity
+  - code-quality
+  - testing
+
+items:
+  # Prompts
+  - path: prompts/write-tests.prompt.md
+    kind: prompt
+    title: Write Unit Tests
+    description: Generate comprehensive unit tests for a given function or module
+    tags: [testing, quality]
+
+  - path: prompts/explain-code.prompt.md
+    kind: prompt
+    title: Explain Code
+    description: Produce a plain-English explanation of a code snippet
+    tags: [documentation, learning]
+
+  - path: prompts/generate-pr-description.prompt.md
+    kind: prompt
+    title: Generate PR Description
+    description: Draft a clear pull request description from a diff or commit log
+    tags: [git, workflow]
+
+  # Instructions
+  - path: instructions/coding-standards.instructions.md
+    kind: instruction
+    title: Coding Standards
+    description: Team coding conventions that Copilot should always follow
+    tags: [standards, style]
+
+  - path: instructions/git-workflow.instructions.md
+    kind: instruction
+    title: Git Workflow
+    description: Branching strategy and commit message conventions
+    tags: [git, workflow]
+
+  # Agents
+  - path: agents/senior-dev.agent.md
+    kind: agent
+    title: Senior Developer
+    description: Acts as an experienced senior engineer for code review and design advice
+    tags: [review, design]
+
+  - path: agents/security-auditor.agent.md
+    kind: agent
+    title: Security Auditor
+    description: Specialises in identifying security vulnerabilities and OWASP risks
+    tags: [security, audit]
+
+  # Skills
+  - path: skills/sql-optimizer/SKILL.md
+    kind: skill
+    title: SQL Query Optimizer
+    description: Analyses and rewrites SQL queries for correctness and performance
+    tags: [sql, database, performance]
+
+  - path: skills/api-doc-generator/SKILL.md
+    kind: skill
+    title: API Documentation Generator
+    description: Reads source code and generates structured API reference documentation
+    tags: [documentation, api]
+
+display:
+  ordering: manual
+  show_badge: true
