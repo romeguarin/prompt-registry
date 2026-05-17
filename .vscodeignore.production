@@ -132,7 +132,8 @@ INTEGRATION_TEST_*.md
 !README.md
 !CHANGELOG.md
 !LICENSE.txt
-!icon.png
+icon.png
+!icon-ado.png
 !dist/extension.js
 !dist/extension.js.LICENSE.txt
 !dist/webview/
