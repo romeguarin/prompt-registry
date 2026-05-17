@@ -1,22 +1,22 @@
 {
-  "name": "prompt-registry",
-  "displayName": "Prompt Registry",
-  "description": "Prompt Registry Framework - AI prompt management framework for VSCode and its forks",
-  "version": "0.0.2",
-  "publisher": "AmadeusITGroup",
+  "name": "prompt-registry-ado-beta",
+  "displayName": "Prompt Registry (with ADO Git Support)",
+  "description": "Prompt Registry Framework - AI prompt management framework for VSCode and its forks - with ADO Git Support",
+  "version": "0.1.0",
+  "publisher": "JaviGuarin",
   "author": {
-    "name": "Amadeus IT Group",
-    "email": "opensource@amadeus.com"
+    "name": "Javi Guarin",
+    "email": "jerome.guarin@outlook.com"
   },
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/AmadeusITGroup/prompt-registry.git"
+    "url": "https://github.com/romeguarin/prompt-registry.git"
   },
   "bugs": {
-    "url": "https://github.com/AmadeusITGroup/prompt-registry/issues"
+    "url": "https://github.com/romeguarin/prompt-registry/issues"
   },
-  "homepage": "https://github.com/AmadeusITGroup/prompt-registry#readme",
+  "homepage": "https://github.com/romeguarin/prompt-registry#readme",
   "keywords": [
     "ai",
     "assistant",
@@ -39,7 +39,7 @@
     "ui"
   ],
   "main": "./dist/extension.js",
-  "icon": "icon.png",
+  "icon": "icon-ado.png",
   "activationEvents": [
     "onStartupFinished"
   ],

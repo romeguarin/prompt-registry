@@ -1,4 +1,6 @@
-# 🎨 Prompt Registry
+# 🎨 Prompt Registry (with ADO Git Repo support)
+
+NOTE: This extension is a beta release, for issues please contact the author.
 
 > A visual marketplace for discovering, installing, and managing GitHub Copilot prompt libraries from multiple sources.
 

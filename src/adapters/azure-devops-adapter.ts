@@ -1,26 +1,25 @@
 /**
  * Azure DevOps Repository Adapter
  *
- * Fetches prompt bundles from Azure DevOps (ADO) Git repositories.
- * Supports both Azure DevOps Services (cloud) and Azure DevOps Server (on-premises).
+ * Fetches prompt bundles from Azure DevOps cloud Git repositories.
+ * 
+ * **Supported:** Azure DevOps Services (https://dev.azure.com only)
+ * **Not Supported:** On-premise installations, visualstudio.com URLs
  *
- * ## Bundle discovery strategy — "full-tree collection scan"
+ * ## Bundle discovery strategy — "targeted collection scan"
  *
- * Rather than listing directories one-by-one and probing each for a manifest
- * (an N+1 HTTP pattern), the adapter retrieves the **entire repository tree
- * in a single API call** using `recursionLevel=Full`, then filters the
- * returned item list in memory for blob entries (files) whose filename ends in
- * `.collection.yml`.
- *
- * Only collection files that sit **exactly one directory level** beneath
- * `collectionsPath` are treated as bundle roots.  This prevents deeply-nested
- * files from accidentally being picked up as separate bundles.
+ * The adapter uses `recursionLevel=OneLevel` to fetch only the collections
+ * directory and its immediate children (depth-0 and depth-1), then filters
+ * for `.collection.yml` files. This is more efficient than fetching the
+ * entire repository tree.
  *
  * After finding collection blob paths, the adapter fetches the **content** of
  * each `.collection.yml` file (one request per bundle) and parses it to
  * construct `Bundle` objects.
  *
- * **API call count**: 1 (full tree) + N (one per discovered bundle)
+ * Results are cached for 5 minutes to reduce API calls.
+ *
+ * **API call count**: 1 (collections tree) + N (one per discovered bundle)
  *
  * ## Downloading bundles
  * Bundles are assembled on the fly: the adapter re-fetches the `.collection.yml`,
@@ -30,7 +29,6 @@
  *
  * ## Configuration example
  *
- * ### Azure DevOps Services (cloud)
  * ```json
  * {
  *   "id": "my-ado-source",
@@ -48,46 +46,22 @@
  * }
  * ```
  *
- * ### Azure DevOps Server (on-premises)
- * ```json
- * {
- *   "id": "my-ado-server-source",
- *   "name": "My ADO Server Prompts",
- *   "type": "azure-devops",
- *   "url": "https://ado.mycompany.com/DefaultCollection/myproject/_git/myrepo",
- *   "enabled": true,
- *   "priority": 1,
- *   "private": true,
- *   "token": "<personal-access-token>",
- *   "config": {
- *     "branch": "main",
- *     "collectionsPath": "/prompt-bundles"
- *   }
- * }
- * ```
- *
  * ## Authentication
- * Configure authentication in priority order — the first option that succeeds is used:
- *
- * 1. **Personal Access Token (PAT)**: Set `token` on the source. Generate a PAT with
- *    "Code (read)" scope at https://dev.azure.com/{org}/_usersettings/tokens.
- *    Produces an `Authorization: Basic base64(":"+PAT)` header.
- *
- * 2. **VS Code Microsoft auth**: Sign in to VS Code with your Microsoft/Entra account.
- *    No CLI tooling needed. The adapter calls `vscode.authentication.getSession('microsoft', ...)`
- *    silently and produces an `Authorization: Bearer <token>` header.
- *
- * 3. **Azure CLI**: Run `az login` before using the extension. The adapter calls
- *    `az account get-access-token` automatically and produces a Bearer header.
+ * 
+ * **Personal Access Token (PAT) - Required**
+ * 
+ * Set `token` on the source. Generate a PAT with "Code (read)" scope at:
+ * https://dev.azure.com/{org}/_usersettings/tokens
+ * 
+ * PAT authentication produces an `Authorization: Basic base64(":"+PAT)` header.
+ * 
+ * Note: VS Code Microsoft auth and Azure CLI authentication are no longer supported.
+ * Only PAT authentication is accepted for Azure DevOps adapter.
  */
 
 import * as https from 'node:https';
 import archiver from 'archiver';
 import * as yaml from 'js-yaml';
-import {
-  AzureDevOpsAuthMethod,
-  AzureDevOpsAuthService,
-} from '../services/azure-devops-auth';
 import {
   Bundle,
   RegistrySource,
@@ -125,6 +99,10 @@ interface CollectionManifest {
   author?: string;
   tags?: string[];
   items: CollectionItem[];
+  mcp?: {
+    items?: Record<string, any>;
+  };
+  mcpServers?: Record<string, any>;
 }
 
 interface CollectionItem {
@@ -192,23 +170,25 @@ export class AzureDevOpsAdapter extends RepositoryAdapter {
   public readonly type = 'azure-devops';
 
   private readonly logger: Logger;
-  private readonly authService: AzureDevOpsAuthService;
 
   /** Cached resolved auth token — set after the first successful authentication */
   private authToken: string | undefined;
-  /** How the cached token was obtained */
-  private authMethod: AzureDevOpsAuthMethod = 'none';
+
+  /** Cache for collections with TTL */
+  private readonly collectionsCache = new Map<string, { bundles: Bundle[]; timestamp: number }>();
+  /** Cache TTL in milliseconds (5 minutes) */
+  private static readonly CACHE_TTL_MS = 5 * 60 * 1000;
 
   constructor(source: RegistrySource) {
     super(source);
     this.logger = Logger.getInstance();
-    this.authService = new AzureDevOpsAuthService();
 
     if (!this.isValidAdoUrl(source.url)) {
       throw new Error(
         `Invalid Azure DevOps URL: "${source.url}". `
-        + 'Expected format: https://dev.azure.com/{org}/{project}/_git/{repo} '
-        + 'or https://{org}.visualstudio.com/{project}/_git/{repo}'
+        + 'Only Azure DevOps cloud URLs are supported. '
+        + 'Expected format: https://dev.azure.com/{org}/{project}/_git/{repo}\n'
+        + 'Note: On-premise installations and visualstudio.com URLs are no longer supported.'
       );
     }
   }
@@ -239,18 +219,20 @@ export class AzureDevOpsAdapter extends RepositoryAdapter {
   // ---------------------------------------------------------------------------
 
   /**
-   * Validate that the given URL looks like an Azure DevOps repository URL.
+   * Validate that the given URL is a valid Azure DevOps cloud repository URL.
    *
-   * Accepted patterns:
-   * - `https://dev.azure.com/.../_git/...`
-   * - `https://*.visualstudio.com/.../_git/...`
-   * - Any other HTTPS URL containing `/_git/` (covers on-premises deployments)
+   * Only accepts:
+   * - `https://dev.azure.com/{org}/{project}/_git/{repo}`
    *
-   * Only HTTPS URLs are accepted to ensure credentials are never sent in plain text.
+   * Rejects:
+   * - On-premise URLs (e.g., `https://ado.mycompany.com/...`)
+   * - Old visualstudio.com URLs (e.g., `https://*.visualstudio.com/...`)
+   * - Non-HTTPS URLs
+   *
    * @param urlString - URL to validate
    */
   private isValidAdoUrl(urlString: string): boolean {
-    if (!urlString.startsWith('https://')) {
+    if (!urlString.startsWith('https://dev.azure.com/')) {
       return false;
     }
     return urlString.includes('/_git/');
@@ -297,26 +279,52 @@ export class AzureDevOpsAdapter extends RepositoryAdapter {
     return `${projectBaseUrl}/_apis/git/repositories/${encodeURIComponent(repository)}`;
   }
 
+  /**
+   * Generate a safe cache key from the source configuration.
+   * Combines org + project + repo + collectionsPath into a sanitized string.
+   * @returns Lowercase alphanumeric string with dashes, safe for use as Map key
+   */
+  private generateCacheKey(): string {
+    const { projectBaseUrl, repository } = this.parseAdoUrl();
+    // Extract org and project from projectBaseUrl
+    // Example: https://dev.azure.com/org/project → org-project
+    const urlParts = projectBaseUrl.replace(/^https?:\/\//, '').split('/');
+    const orgAndProject = urlParts.filter(Boolean).join('-');
+    
+    // Combine all parts: org-project-repo-collectionsPath
+    const parts = [orgAndProject, repository, this.collectionsPath];
+    
+    // Sanitize: replace special chars with dashes, lowercase
+    return parts
+      .join('-')
+      .replace(/[^a-zA-Z0-9-]/g, '-')
+      .replace(/-+/g, '-')
+      .replace(/^-|-$/g, '')
+      .toLowerCase();
+  }
+
   // ---------------------------------------------------------------------------
   // Authentication
   // ---------------------------------------------------------------------------
 
   /**
-   * Resolve and cache the authentication token.
-   * Uses `source.token` (PAT) first, then Azure CLI fallback.
+   * Resolve and cache the authentication token (PAT only).
+   * Returns the Personal Access Token from source.token.
    */
-  private async getAuthenticationToken(): Promise<{ token: string; method: AzureDevOpsAuthMethod } | undefined> {
+  private async getAuthenticationToken(): Promise<{ token: string } | undefined> {
     if (this.authToken !== undefined) {
-      this.logger.debug(`[AzureDevOpsAdapter] Using cached token (method: ${this.authMethod})`);
-      return { token: this.authToken, method: this.authMethod };
+      this.logger.debug(`[AzureDevOpsAdapter] Using cached PAT token`);
+      return { token: this.authToken };
     }
 
-    const result = await this.authService.getToken(this.getAuthToken());
-    if (result) {
-      this.authToken = result.token;
-      this.authMethod = result.method;
+    const pat = this.getAuthToken();
+    if (!pat) {
+      this.logger.warn('[AzureDevOpsAdapter] No PAT configured. Requests will be unauthenticated.');
+      return undefined;
     }
-    return result ?? undefined;
+
+    this.authToken = pat;
+    return { token: pat };
   }
 
   // ---------------------------------------------------------------------------
@@ -324,7 +332,7 @@ export class AzureDevOpsAdapter extends RepositoryAdapter {
   // ---------------------------------------------------------------------------
 
   /**
-   * Build request headers including the Authorization header when a token is available.
+   * Build request headers including the Authorization header when a PAT is available.
    * @param accept - Accept header value
    */
   private async buildHeaders(accept: string): Promise<Record<string, string>> {
@@ -335,10 +343,12 @@ export class AzureDevOpsAdapter extends RepositoryAdapter {
 
     const auth = await this.getAuthenticationToken();
     if (auth) {
-      headers.Authorization = this.authService.buildAuthHeader(auth.token, auth.method);
-      this.logger.debug(`[AzureDevOpsAdapter] Auth header set (method: ${auth.method})`);
+      // PAT authentication uses Basic auth with empty username
+      const encodedPat = Buffer.from(`:${auth.token}`).toString('base64');
+      headers.Authorization = `Basic ${encodedPat}`;
+      this.logger.debug(`[AzureDevOpsAdapter] Auth header set (PAT)`);
     } else {
-      this.logger.debug('[AzureDevOpsAdapter] No auth header — unauthenticated request');
+      this.logger.warn('[AzureDevOpsAdapter] No PAT configured — unauthenticated request will likely fail');
     }
 
     return headers;
@@ -353,16 +363,16 @@ export class AzureDevOpsAdapter extends RepositoryAdapter {
     switch (statusCode) {
       case 401: {
         return `Azure DevOps authentication failed (HTTP 401) for ${requestUrl}. `
-          + 'Check that your PAT has "Code (read)" scope, sign in to VS Code with your '
-          + 'Microsoft account, or run `az login`.';
+          + 'Please provide a Personal Access Token (PAT) with "Code (read)" scope. '
+          + 'Generate a PAT at https://dev.azure.com/{org}/_usersettings/tokens';
       }
       case 403: {
         return `Azure DevOps access denied (HTTP 403) for ${requestUrl}. `
-          + 'Your token may lack the required permissions.';
+          + 'Your PAT may lack the required permissions. Ensure it has "Code (read)" scope.';
       }
       case 404: {
         return `Azure DevOps resource not found (HTTP 404) for ${requestUrl}. `
-          + 'Verify the organization, project, repository name, and branch.';
+          + 'Verify the organization, project, repository name, and branch are correct.';
       }
       default: {
         return `Azure DevOps API error (HTTP ${statusCode}) for ${requestUrl}.`;
@@ -512,21 +522,41 @@ export class AzureDevOpsAdapter extends RepositoryAdapter {
   }
 
   /**
-   * Fetch **all** Git items in the repository in a **single API call** using
-   * `recursionLevel=Full`.
+   * Fetch Git items at the collections path using OneLevel recursion.
    *
-   * The ADO Items API returns a flat list of every blob (file) and tree
-   * (directory) in the repository, together with their `path`, `isFolder`,
-   * and `gitObjectType` fields.  Retrieving the full tree in one request is
-   * the foundation of the efficient blob-scan discovery strategy.
-   *
-   * The `path` query parameter is intentionally **omitted** from this call.
-   * Passing `path=<folder>` with `recursionLevel=Full` is unreliable across
-   * ADO versions and on-premises installations — some return HTTP 400 for any
-   * path value, others reject only `path=/` or percent-encoded slashes.
-   * Fetching the whole tree from root and filtering in memory via
-   * {@link findManifestBlobs} is simpler, correct on every ADO version, and
-   * has no correctness cost (prompt bundle repos are typically small).
+   * Uses `path={collectionsPath}&recursionLevel=OneLevel` to fetch only:
+   * - The collections directory itself
+   * - Its direct children (files and subdirectories at depth-0 and depth-1)
+   * 
+   * This is more efficient than `recursionLevel=Full` which fetches the entire
+   * repository. We only need collection files that sit exactly one level beneath
+   * collectionsPath, so OneLevel recursion is perfect for this use case.
+   * 
+   * @returns Flat array of items at collectionsPath and one level deep
+   */
+  private async fetchCollectionsTree(): Promise<AdoItem[]> {
+    const apiBase = this.buildApiBase();
+    const params = new URLSearchParams({
+      recursionLevel: 'OneLevel',
+      'versionDescriptor.version': this.branch,
+      'versionDescriptor.versionType': 'branch',
+      'api-version': ADO_API_VERSION
+    });
+    // Append path manually to avoid URL encoding issues with slashes
+    const requestUrl = `${apiBase}/items?${params.toString()}&path=${this.encodePath(this.collectionsPath)}`;
+
+    this.logger.debug(
+      `[AzureDevOpsAdapter] Fetching collections tree at "${this.collectionsPath}" `
+      + `(branch: ${this.branch}, recursionLevel: OneLevel)`
+    );
+    const responseText = await this.fetchString(requestUrl);
+    const response = JSON.parse(responseText) as AdoItemsResponse;
+    return response.value ?? [];
+  }
+
+  /**
+   * Fetch all items in the repository with Full recursion.
+   * Used only when downloading bundles to resolve skill directory contents.
    * @returns Flat array of every item (blob or tree) in the repository
    */
   private async fetchFullTree(): Promise<AdoItem[]> {
@@ -540,8 +570,7 @@ export class AzureDevOpsAdapter extends RepositoryAdapter {
     const requestUrl = `${apiBase}/items?${params.toString()}`;
 
     this.logger.debug(
-      `[AzureDevOpsAdapter] Fetching full tree at "${this.collectionsPath}" `
-      + `(branch: ${this.branch})`
+      `[AzureDevOpsAdapter] Fetching full tree (branch: ${this.branch}, recursionLevel: Full)`
     );
     const responseText = await this.fetchString(requestUrl);
     const response = JSON.parse(responseText) as AdoItemsResponse;
@@ -696,6 +725,8 @@ export class AzureDevOpsAdapter extends RepositoryAdapter {
     collectionPath: string
   ): Bundle {
     const bundleId = collection.id ?? dirName;
+    const mcpServers = collection.mcpServers || collection.mcp?.items;
+    const breakdown = this.calculateBreakdown(collection.items, mcpServers);
 
     return {
       id: bundleId,
@@ -712,7 +743,8 @@ export class AzureDevOpsAdapter extends RepositoryAdapter {
       license: 'Unknown',
       manifestUrl: this.getCollectionFileUrl(collectionPath),
       downloadUrl: this.getCollectionFileUrl(collectionPath),
-      repository: this.source.url
+      repository: this.source.url,
+      breakdown
     };
   }
 
@@ -729,6 +761,50 @@ export class AzureDevOpsAdapter extends RepositoryAdapter {
       skill: 'skill'
     };
     return kindMap[kind] ?? 'prompt';
+  }
+
+  /**
+   * Calculate content breakdown from collection items and MCPs.
+   * Returns counts for prompts, instructions, chatmodes, agents, skills, and mcpServers.
+   * @param items - Collection items to count
+   * @param mcpServers - MCP servers configuration
+   */
+  private calculateBreakdown(items: CollectionItem[], mcpServers?: Record<string, any>): Record<string, number> {
+    const breakdown = {
+      prompts: 0,
+      instructions: 0,
+      chatmodes: 0,
+      agents: 0,
+      skills: 0,
+      mcpServers: mcpServers ? Object.keys(mcpServers).length : 0
+    };
+
+    for (const item of items) {
+      switch (item.kind) {
+        case 'prompt': {
+          breakdown.prompts++;
+          break;
+        }
+        case 'instruction': {
+          breakdown.instructions++;
+          break;
+        }
+        case 'chat-mode': {
+          breakdown.chatmodes++;
+          break;
+        }
+        case 'agent': {
+          breakdown.agents++;
+          break;
+        }
+        case 'skill': {
+          breakdown.skills++;
+          break;
+        }
+      }
+    }
+
+    return breakdown;
   }
 
   /**
@@ -780,7 +856,7 @@ export class AzureDevOpsAdapter extends RepositoryAdapter {
       };
     });
 
-    return {
+    const manifest: Record<string, unknown> = {
       id: collection.id ?? dirName,
       name: collection.name,
       version: collection.version ?? '1.0.0',
@@ -791,6 +867,14 @@ export class AzureDevOpsAdapter extends RepositoryAdapter {
       tags: collection.tags ?? [],
       prompts
     };
+
+    // Include MCPs if present (support both modern and legacy formats)
+    const mcpServers = collection.mcpServers || collection.mcp?.items;
+    if (mcpServers && Object.keys(mcpServers).length > 0) {
+      manifest.mcpServers = mcpServers;
+    }
+
+    return manifest;
   }
 
   /**
@@ -904,28 +988,31 @@ export class AzureDevOpsAdapter extends RepositoryAdapter {
 
   /**
    * Force re-authentication by clearing the cached token.
-   * The next request will re-attempt the full authentication fallback chain.
+   * The next request will re-read the PAT from source configuration.
    */
   public override forceAuthentication(): Promise<void> {
-    this.logger.info('[AzureDevOpsAdapter] Invalidating cached authentication token');
+    this.logger.info('[AzureDevOpsAdapter] Invalidating cached PAT token');
     this.authToken = undefined;
-    this.authMethod = 'none';
     return Promise.resolve();
   }
 
   /**
    * Fetch all bundles from the Azure DevOps repository.
    *
-   * Uses the **full-tree blob-scan** strategy for efficient discovery:
+   * Uses caching with 5-minute TTL to reduce API calls.
+   * 
+   * Discovery strategy:
    *
-   * 1. **Fetch the full tree** — one `GET /items?recursionLevel=Full` call
+   * 1. **Check cache** — return cached bundles if < 5 minutes old
+   * 
+   * 2. **Fetch the full tree** — one `GET /items?recursionLevel=Full` call
    *    retrieves every file and directory in the repository at once.
    *
-   * 2. **Filter collection blobs** — scan the returned item list in memory for
+   * 3. **Filter collection blobs** — scan the returned item list in memory for
    *    `.collection.yml` files that sit exactly one level beneath
    *    `collectionsPath`.  This avoids probing every subdirectory individually.
    *
-   * 3. **Fetch collection content** — for each `.collection.yml` blob found,
+   * 4. **Fetch collection content** — for each `.collection.yml` blob found,
    *    one `GET /items?path=…` call retrieves the file content, which is then
    *    parsed and converted to a `Bundle`.
    *
@@ -938,15 +1025,26 @@ export class AzureDevOpsAdapter extends RepositoryAdapter {
       + `(branch: ${this.branch}, path: ${this.collectionsPath})`
     );
 
+    // ── Check cache first ───────────────────────────────────────────────────
+    const cacheKey = this.generateCacheKey();
+    const cached = this.collectionsCache.get(cacheKey);
+    if (cached && Date.now() - cached.timestamp < AzureDevOpsAdapter.CACHE_TTL_MS) {
+      this.logger.debug(
+        `[AzureDevOpsAdapter] Using cached bundles (${cached.bundles.length} bundles, `
+        + `age: ${Math.round((Date.now() - cached.timestamp) / 1000)}s)`
+      );
+      return cached.bundles;
+    }
+
     try {
-      // ── Step 1: Retrieve the full repository tree in a single API call ──────
-      const allItems = await this.fetchFullTree();
+      // ── Step 1: Fetch collections tree with OneLevel recursion ──────────────
+      const allItems = await this.fetchCollectionsTree();
 
       // ── Step 2: Filter for .collection.yml blobs exactly one level deep ─────
       const collectionBlobs = this.findCollectionBlobs(allItems);
 
       this.logger.debug(
-        `[AzureDevOpsAdapter] Full tree: ${allItems.length} item(s), `
+        `[AzureDevOpsAdapter] Collections tree: ${allItems.length} item(s), `
         + `${collectionBlobs.length} collection blob(s) found`
       );
 
@@ -978,6 +1076,11 @@ export class AzureDevOpsAdapter extends RepositoryAdapter {
       }
 
       this.logger.info(`[AzureDevOpsAdapter] Discovered ${bundles.length} bundle(s)`);
+      
+      // ── Cache the results ────────────────────────────────────────────────────
+      this.collectionsCache.set(cacheKey, { bundles, timestamp: Date.now() });
+      this.logger.debug(`[AzureDevOpsAdapter] Cached ${bundles.length} bundles with key: ${cacheKey}`);
+      
       return bundles;
     } catch (error) {
       throw new Error(`Failed to fetch bundles from Azure DevOps: ${error}`);
